@@ -137,9 +137,9 @@ def _verify_checksum(message: AnyStr, expected_checksum_hex: AnyStr) -> None:
     """
     expected_checksum = int(expected_checksum_hex, 16)
     if isinstance(message, bytes):
-        all_bytes = (c for c in message)
+        all_bytes = list(message)
     else:
-        all_bytes = (ord(c) for c in message)
+        all_bytes = [ord(c) for c in message]
 
     calculated_checksum = sum(all_bytes)
 
@@ -303,18 +303,35 @@ class Session:
         """Read the response from the device and extracts it."""
         usb_packet = self._handle.read()
 
-        logging.debug(f"Read packet: {usb_packet!r}")
+        # logging.debug(f"Read packet: {usb_packet!r}")
 
-        assert usb_packet
+        if not usb_packet:
+            # Depending on backend, might return empty bytes or block forever
+            raise TimeoutError("Device returned empty packet")
+
+        # Handle Report IDs
+        if len(usb_packet) == 65:
+            usb_packet = usb_packet[1:]
+
         message_type = usb_packet[0]
 
         if (
             self._encrypted_protocol
             and message_type not in _ALWAYS_UNENCRYPTED_MESSAGES
         ):
-            usb_packet = self.decrypt_message(usb_packet)
+            try:
+                usb_packet = self.decrypt_message(usb_packet)
+                message_type = usb_packet[0] # Update after decrypt
+            except Exception as e:
+                logging.warning(f"Decrypt failed in read_response: {e}")
 
         message_length = usb_packet[1]
+        
+        # Verify length
+        if 2 + message_length > len(usb_packet):
+             # This happens if a packet is cut short by the OS
+             logging.error(f"Packet corrupted: declared len {message_length}, actual {len(usb_packet)}")
+
         message_end_idx = 2 + message_length
         message_content = usb_packet[2:message_end_idx]
 
@@ -349,11 +366,10 @@ class Session:
         while True:
             message_type, content = self.read_response()
 
-            logging.debug(
-                f"Received message: type {message_type:02x} content {content.hex()}"
-            )
-
             if message_type != self._text_reply_message_type:
+                # If we see 0x22 here (keepalive) that somehow slipped through, ignore it
+                if message_type == 0x22: continue
+                
                 raise CommandError(
                     f"Message type {message_type:02x}: content does not match expectations: {content!r}"
                 )
@@ -396,7 +412,7 @@ class Session:
           reply buffer.
         """
         message = self._send_text_command_raw(command)
-        logging.debug(f"Received multi-record message:\n{message!r}")
+        # logging.debug(f"Received multi-record message:\n{message!r}")
         if message == b"Log Empty\r\n":
             return iter(())
 
@@ -410,7 +426,5 @@ class Session:
         # Decode here with replacement; the software does not deal with UTF-8
         # correctly, and appears to truncate incorrectly the strings.
         records_str = records_raw.decode(self._encoding, "replace")
-
-        logging.debug(f"Received multi-record string: {records_str}")
 
         return csv.reader(records_str.split("\r\n"))

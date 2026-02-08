@@ -4,6 +4,7 @@
 
 import abc
 import pathlib
+import os
 from typing import BinaryIO, Optional, Union
 
 try:
@@ -21,8 +22,12 @@ class HidWrapper(abc.ABC):
         if len(report) > 65:
             raise HIDError(f"Invalid report length {len(report)}.")
 
-        written = self._handle.write(report)
-        if written < 0:
+        if hasattr(self._handle, "write"):
+            written = self._handle.write(report)
+        else:
+            written = os.write(self._handle, report)
+
+        if written is not None and written < 0:
             raise HIDError(f"Invalid write ({written}).")
 
     @abc.abstractmethod
@@ -43,12 +48,16 @@ class HidWrapper(abc.ABC):
 class HidRaw(HidWrapper):
     def __init__(self, device_path: pathlib.Path) -> None:
         if not device_path.exists():
-            raise ValueError(f"Path {device_path} does not exists.")
+            raise ValueError(f"Path {device_path} does not exist.")
+        self._fd = os.open(str(device_path), os.O_RDWR)
+        self._handle = self._fd
 
-        self._handle = device_path.open("w+b")
+    def __del__(self):
+        if hasattr(self, "_fd"):
+            os.close(self._fd)
 
     def read(self, size: int = 64) -> bytes:
-        return self._handle.read(size)
+        return os.read(self._fd, size)
 
 
 class HidApi(HidWrapper):
@@ -57,9 +66,11 @@ class HidApi(HidWrapper):
     def __init__(self, vendor_id: int, product_id: int) -> None:
         if hid is None:
             raise ValueError("cython-hidapi not found.")
-
         self._handle = hid.device()
         self._handle.open(vendor_id, product_id)
 
     def read(self, size: int = 64) -> bytes:
-        return bytes(self._handle.read(size, timeout_ms=0))
+        # Standard blocking read (timeout=0 means non-blocking in hidapi, 
+        # but we want blocking here so we rely on default or a long timeout)
+        data = self._handle.read(size)
+        return bytes(data)
