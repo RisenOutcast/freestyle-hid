@@ -137,9 +137,9 @@ def _verify_checksum(message: AnyStr, expected_checksum_hex: AnyStr) -> None:
     """
     expected_checksum = int(expected_checksum_hex, 16)
     if isinstance(message, bytes):
-        all_bytes = list(message)
+        all_bytes = (c for c in message)
     else:
-        all_bytes = [ord(c) for c in message]
+        all_bytes = (ord(c) for c in message)
 
     calculated_checksum = sum(all_bytes)
 
@@ -306,12 +306,16 @@ class Session:
         # logging.debug(f"Read packet: {usb_packet!r}")
 
         if not usb_packet:
-            # Depending on backend, might return empty bytes or block forever
+            # If blocking read returns nothing, it's a true timeout/error
             raise TimeoutError("Device returned empty packet")
 
         # Handle Report IDs
         if len(usb_packet) == 65:
             usb_packet = usb_packet[1:]
+        
+        # Safe guard against garbage
+        if len(usb_packet) < 2:
+             return self.read_response(encrypted=encrypted)
 
         message_type = usb_packet[0]
 
@@ -321,16 +325,16 @@ class Session:
         ):
             try:
                 usb_packet = self.decrypt_message(usb_packet)
-                message_type = usb_packet[0] # Update after decrypt
+                message_type = usb_packet[0] 
             except Exception as e:
-                logging.warning(f"Decrypt failed in read_response: {e}")
+                logging.warning(f"Decrypt failed: {e}")
 
         message_length = usb_packet[1]
         
-        # Verify length
         if 2 + message_length > len(usb_packet):
-             # This happens if a packet is cut short by the OS
-             logging.error(f"Packet corrupted: declared len {message_length}, actual {len(usb_packet)}")
+            # Verify that the received packet contains the full expected payload. 
+            # If the expected length exceeds the actual data received, log the truncation.
+            logging.error(f"Packet truncated: len={len(usb_packet)}, expected={message_length}")
 
         message_end_idx = 2 + message_length
         message_content = usb_packet[2:message_end_idx]
@@ -361,8 +365,11 @@ class Session:
         """Send a command to the device that expects a text reply."""
         self.send_command(self._text_message_type, command)
 
-        # Reply can stretch multiple buffers
-        full_content = b""
+        # Device replies can span multiple HID packets.
+        # We collect these sequential packets in a list to efficiently 
+        # assemble the complete response in memory later.
+        chunks = []
+        
         while True:
             message_type, content = self.read_response()
 
@@ -370,18 +377,24 @@ class Session:
                 # If we see 0x22 here (keepalive) that somehow slipped through, ignore it
                 if message_type == 0x22: continue
                 
-                raise CommandError(
-                    f"Message type {message_type:02x}: content does not match expectations: {content!r}"
-                )
+                # If we get a valid but unexpected message type, log it
+                logging.warning(f"Unexpected message type {message_type:02x}, ignoring.")
+                continue
 
-            full_content += content
+            chunks.append(content)
 
-            if _TEXT_COMPLETION_RE.search(full_content):
+            # Check only the most recently received chunk for the termination string.
+            # This keeps the read loop fast and prevents USB buffer overflows.
+            if b"CMD OK" in content or b"CMD Fail" in content:
                 break
+
+        # Assemble the final response payload
+        full_content = b"".join(chunks)
 
         match = _TEXT_REPLY_FORMAT.search(full_content)
         if not match:
-            raise CommandError(repr(full_content))
+            # If the termination string was found but the regex fails, the data is malformed.
+            raise CommandError(f"Reply format mismatch. Length: {len(full_content)}")
 
         message = match.group("message")
         _verify_checksum(message, match.group("checksum"))
